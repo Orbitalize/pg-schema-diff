@@ -2,8 +2,10 @@ package diff
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
@@ -13,7 +15,6 @@ import (
 	externalschema "github.com/stripe/pg-schema-diff/pkg/schema"
 
 	"github.com/stripe/pg-schema-diff/pkg/log"
-	"github.com/stripe/pg-schema-diff/pkg/sqldb"
 	"github.com/stripe/pg-schema-diff/pkg/tempdb"
 )
 
@@ -33,6 +34,8 @@ type (
 		logger                  log.Logger
 		validatePlan            bool
 		getSchemaOpts           []schema.GetSchemaOpt
+		randReader              io.Reader
+		noConcurrentIndexOps    bool
 	}
 
 	PlanOpt func(opts *planOptions)
@@ -93,23 +96,21 @@ func WithGetSchemaOpts(getSchemaOpts ...externalschema.GetSchemaOpt) PlanOpt {
 	}
 }
 
-// deprecated: GeneratePlan generates a migration plan to migrate the database to the target schema. This function only
-// diffs the public schemas.
-//
-// Use Generate instead with the DDLSchemaSource(newDDL) and WithIncludeSchemas("public") and WithTempDbFactory options.
-//
-// Parameters:
-// queryable: 	The target database to generate the diff for. It is recommended to pass in *sql.DB of the db you
-// wish to migrate. If using a connection pool, it is RECOMMENDED to set a maximum number of connections.
-// tempDbFactory:  	used to create a temporary database instance to extract the schema from the new DDL and validate the
-// migration plan. It is recommended to use tempdb.NewOnInstanceFactory, or you can provide your own.
-// newDDL:  		DDL encoding the new schema
-// opts:  			Additional options to configure the plan generation
-func GeneratePlan(ctx context.Context, queryable sqldb.Queryable, tempdbFactory tempdb.Factory, newDDL []string, opts ...PlanOpt) (Plan, error) {
+// WithRandReader seeds the random used to generate random SQL identifiers, e.g., temporary not-null check constraints.
+func WithRandReader(randReader io.Reader) PlanOpt {
+	return func(opts *planOptions) {
+		opts.randReader = randReader
+	}
+}
 
-	schemaSource := DBSchemaSource(queryable)
-
-	return Generate(ctx, schemaSource, DDLSchemaSource(newDDL), append(opts, WithTempDbFactory(tempdbFactory), WithIncludeSchemas("public"))...)
+// WithNoConcurrentIndexOps disables the use of CONCURRENTLY in CREATE INDEX and DROP INDEX statements.
+// This can be useful when you need simpler DDL statements or when working in environments that don't support
+// concurrent index operations. Note that disabling concurrent operations may result in longer lock times
+// and potential downtime during migrations.
+func WithNoConcurrentIndexOps() PlanOpt {
+	return func(opts *planOptions) {
+		opts.noConcurrentIndexOps = true
+	}
 }
 
 // Generate generates a migration plan to migrate the database to the target schema
@@ -129,6 +130,7 @@ func Generate(
 		validatePlan:            true,
 		ignoreChangesToColOrder: true,
 		logger:                  log.SimpleLogger(),
+		randReader:              rand.Reader,
 	}
 	for _, opt := range opts {
 		opt(planOptions)
@@ -196,7 +198,7 @@ func generateMigrationStatements(oldSchema, newSchema schema.Schema, planOptions
 		diff = removeChangesToColumnOrdering(diff)
 	}
 
-	statements, err := diff.resolveToSQL()
+	statements, err := newSchemaSQLGenerator(planOptions.randReader, planOptions).Alter(diff)
 	if err != nil {
 		return nil, fmt.Errorf("generating migration statements: %w", err)
 	}

@@ -42,11 +42,11 @@ func buildPlanCmd() *cobra.Command {
 	toSchemaFlags := createSchemaSourceFlags(cmd, "to-")
 	tempDbConnFlags := createConnectionFlags(cmd, "temp-db-", "The temporary database to use for schema extraction. This is optional if diffing to/from a Postgres instance")
 	planOptsFlags := createPlanOptionsFlags(cmd)
-	outputFmt := outputFormatPretty
+	outputFmt := outputFormatSql
 	cmd.Flags().Var(
 		&outputFmt,
 		"output-format",
-		fmt.Sprintf("Change the output format for what is printed. Defaults to pretty-printed human-readable output. (options: %s)", strings.Join(outputFormatStrings(), ", ")),
+		fmt.Sprintf("Change the output format for what is printed. Defaults to %v. (options: %s)", outputFmt.identifier, strings.Join(outputFormatStrings(), ", ")),
 	)
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
 		logger := log.SimpleLogger()
@@ -99,7 +99,7 @@ func buildPlanCmd() *cobra.Command {
 			return err
 		}
 
-		cmd.Println(outputFmt.convertToOutputString(plan))
+		cmdPrintln(cmd, outputFmt.convertToOutputString(plan))
 		return nil
 	}
 
@@ -114,6 +114,7 @@ type (
 
 		dataPackNewTables     bool
 		disablePlanValidation bool
+		noConcurrentIndexOps  bool
 
 		statementTimeoutModifiers []string
 		lockTimeoutModifiers      []string
@@ -162,17 +163,23 @@ type (
 )
 
 var (
-	outputFormatPretty = outputFormat{
-		identifier:            "pretty",
-		convertToOutputString: planToPrettyS,
-	}
-
 	outputFormatJson = outputFormat{
 		identifier:            "json",
 		convertToOutputString: planToJsonS,
 	}
 
+	outputFormatSql = outputFormat{
+		identifier:            "sql",
+		convertToOutputString: planToSql,
+	}
+
+	outputFormatPretty = outputFormat{
+		identifier:            "pretty",
+		convertToOutputString: planToPrettyS,
+	}
+
 	outputFormats = []outputFormat{
+		outputFormatSql,
 		outputFormatPretty,
 		outputFormatJson,
 	}
@@ -216,6 +223,8 @@ func createPlanOptionsFlags(cmd *cobra.Command) *planOptionsFlags {
 	cmd.Flags().BoolVar(&flags.dataPackNewTables, "data-pack-new-tables", true, "If set, will data pack new tables in the plan to minimize table size (re-arranges columns).")
 	cmd.Flags().BoolVar(&flags.disablePlanValidation, "disable-plan-validation", false, "If set, will disable plan validation. Plan validation runs the migration against a temporary"+
 		"database with an identical schema to the original, asserting that the generated plan actually migrates the schema to the desired target.")
+	cmd.Flags().BoolVar(&flags.noConcurrentIndexOps, "no-concurrent-index-ops", false, "If set, will disable the use of CONCURRENTLY in CREATE INDEX and DROP INDEX statements. "+
+		"This may result in longer lock times and potential downtime during migrations.")
 
 	timeoutModifierFlagVar(cmd, &flags.statementTimeoutModifiers, "statement", "t")
 	timeoutModifierFlagVar(cmd, &flags.lockTimeoutModifiers, "lock", "l")
@@ -314,6 +323,9 @@ func parsePlanOptions(p planOptionsFlags) (planOptions, error) {
 	}
 	if p.disablePlanValidation {
 		opts = append(opts, diff.WithDoNotValidatePlan())
+	}
+	if p.noConcurrentIndexOps {
+		opts = append(opts, diff.WithNoConcurrentIndexOps())
 	}
 
 	var statementTimeoutModifiers []timeoutModifier
@@ -584,10 +596,33 @@ func hazardToPrettyS(hazard diff.MigrationHazard) string {
 	}
 }
 
+// planToJsonS converts the plan to JSON.
 func planToJsonS(plan diff.Plan) string {
 	jsonData, err := json.MarshalIndent(plan, "", "  ")
 	if err != nil {
 		panic(err)
 	}
 	return string(jsonData)
+}
+
+// planToSql converts the plan to one large runnable SQL script.
+func planToSql(plan diff.Plan) string {
+	sb := strings.Builder{}
+	for i, stmt := range plan.Statements {
+		sb.WriteString("/*\n")
+		sb.WriteString(fmt.Sprintf("Statement %d\n", i))
+		if len(stmt.Hazards) > 0 {
+			for _, hazard := range stmt.Hazards {
+				sb.WriteString(fmt.Sprintf("  - %s\n", hazardToPrettyS(hazard)))
+			}
+		}
+		sb.WriteString("*/\n")
+		sb.WriteString(fmt.Sprintf("SET SESSION statement_timeout = %d;\n", stmt.Timeout.Milliseconds()))
+		sb.WriteString(fmt.Sprintf("SET SESSION lock_timeout = %d;\n", stmt.LockTimeout.Milliseconds()))
+		sb.WriteString(fmt.Sprintf("%s;", stmt.DDL))
+		if i < len(plan.Statements)-1 {
+			sb.WriteString("\n\n")
+		}
+	}
+	return sb.String()
 }

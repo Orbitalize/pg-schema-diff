@@ -1,6 +1,8 @@
 package migration_acceptance_tests
 
 import (
+	"testing"
+
 	"github.com/stripe/pg-schema-diff/pkg/diff"
 )
 
@@ -132,7 +134,7 @@ var functionAcceptanceTestCases = []acceptanceTestCase{
                 RETURNS NULL ON NULL INPUT
                 RETURN CONCAT(a, b);
 
-            -- identical function on a different schem
+            -- identical function on a different schema
             CREATE SCHEMA schema_2;
             CREATE FUNCTION schema_2.add(a integer, b integer) RETURNS text
                 LANGUAGE SQL
@@ -657,6 +659,6 @@ var functionAcceptanceTestCases = []acceptanceTestCase{
 	},
 }
 
-func (suite *acceptanceTestSuite) TestFunctionTestCases() {
-	suite.runTestCases(functionAcceptanceTestCases)
+func TestFunctionTestCases(t *testing.T) {
+	runTestCases(t, functionAcceptanceTestCases)
 }
